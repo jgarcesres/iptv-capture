@@ -34,6 +34,11 @@ async function captureStream(channel) {
 
     page.on("request", (request) => {
       const url = request.url();
+      // Debug: log video-related requests
+      const lower = url.toLowerCase();
+      if (lower.includes(".mpd") || lower.includes(".m3u8") || lower.includes("manifest")) {
+        console.log(`[capture] ${channel.id}: [req] ${url.substring(0, 150)}`);
+      }
       if (isStreamRequest(url, channel.capturePatterns)) {
         streamUrls.push(url);
       }
@@ -75,6 +80,10 @@ async function captureStream(channel) {
         );
       }
     }
+
+    // Debug: log page title and check for error states
+    const title = await page.title();
+    console.log(`[capture] ${channel.id}: page title="${title}", streams so far: ${streamUrls.length}`);
 
     // Wait for stream requests to appear
     const startTime = Date.now();
