@@ -23,11 +23,12 @@ const DEFAULT_CHANNELS = [
     name: "Canal RCN",
     url: "https://www.canalrcn.com/co/tv-en-vivo",
     logo: "https://upload.wikimedia.org/wikipedia/commons/a/a4/Canal_RCN_logo.svg",
-    capturePatterns: [".m3u8", ".mpd", "mdstrm"],
-    actions: [],
-    // RCN may need play button click, then wait through ad
-    // Temporarily disabled until we debug the player further
-    disabled: true,
+    // RCN uses TBX player with Broadpeak CDN (DASH .mpd)
+    // Stream autoplays after a preroll ad — no actions needed
+    capturePatterns: [".mpd", "broadpeak.io"],
+    actions: [
+      { type: "wait", ms: 20000 },
+    ],
   },
 ];
 
