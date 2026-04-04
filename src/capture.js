@@ -36,8 +36,23 @@ async function captureStream(channel) {
     // Collect all m3u8 URLs we see
     const m3u8Urls = [];
 
+    // Log all network requests for debugging
+    const allUrls = [];
+
     page.on("request", (request) => {
       const url = request.url();
+      // Track media-related requests for debugging
+      if (
+        url.includes(".m3u8") ||
+        url.includes(".mpd") ||
+        url.includes("manifest") ||
+        url.includes("stream") ||
+        url.includes("mdstrm") ||
+        url.includes("playlist")
+      ) {
+        console.log(`[capture] ${channel.id}: [req] ${url.substring(0, 150)}`);
+        allUrls.push(url);
+      }
       if (isM3u8Request(url, channel.capturePatterns)) {
         m3u8Urls.push(url);
       }
@@ -49,8 +64,12 @@ async function captureStream(channel) {
       if (
         contentType.includes("mpegurl") ||
         contentType.includes("x-mpegurl") ||
+        contentType.includes("dash") ||
         isM3u8Request(url, channel.capturePatterns)
       ) {
+        console.log(
+          `[capture] ${channel.id}: [res] ${url.substring(0, 150)} (${contentType})`
+        );
         if (!m3u8Urls.includes(url)) {
           m3u8Urls.push(url);
         }
@@ -59,9 +78,11 @@ async function captureStream(channel) {
 
     console.log(`[capture] ${channel.id}: navigating to ${channel.url}`);
     await page.goto(channel.url, {
-      waitUntil: "domcontentloaded",
+      waitUntil: "networkidle",
       timeout: CAPTURE_TIMEOUT_MS,
     });
+
+    console.log(`[capture] ${channel.id}: page loaded, waiting for stream...`);
 
     // Execute any page-specific actions (click play, dismiss modals, etc.)
     for (const action of channel.actions || []) {
@@ -79,11 +100,38 @@ async function captureStream(channel) {
       }
     }
 
+    // Try clicking common play button selectors
+    const playSelectors = [
+      "button[aria-label='Play']",
+      ".vjs-big-play-button",
+      ".play-button",
+      "[class*='play']",
+      "video",
+    ];
+    for (const sel of playSelectors) {
+      try {
+        const el = await page.$(sel);
+        if (el) {
+          await el.click();
+          console.log(`[capture] ${channel.id}: auto-clicked ${sel}`);
+          await page.waitForTimeout(3000);
+          break;
+        }
+      } catch {
+        // ignore
+      }
+    }
+
     // Wait for m3u8 request to appear
     const startTime = Date.now();
     while (m3u8Urls.length === 0 && Date.now() - startTime < CAPTURE_TIMEOUT_MS) {
-      await page.waitForTimeout(1000);
+      await page.waitForTimeout(2000);
     }
+
+    // Log page title and URL for debugging
+    console.log(
+      `[capture] ${channel.id}: final URL=${page.url()}, tracked ${allUrls.length} media-related requests`
+    );
 
     await context.close();
 
