@@ -8,10 +8,8 @@ const CAPTURE_TIMEOUT_MS = parseInt(
  * Captures the live HLS m3u8 URL from a single channel page.
  *
  * Opens a headless Chromium browser, navigates to the channel URL,
- * and intercepts network requests to find the master m3u8 playlist.
- *
- * @param {Object} channel - Channel config
- * @returns {Promise<string|null>} The captured m3u8 URL, or null on failure
+ * executes page-specific actions, and intercepts network requests
+ * to find the stream manifest (m3u8 or mpd).
  */
 async function captureStream(channel) {
   let browser;
@@ -32,29 +30,12 @@ async function captureStream(channel) {
     });
 
     const page = await context.newPage();
-
-    // Collect all m3u8 URLs we see
-    const m3u8Urls = [];
-
-    // Log all network requests for debugging
-    const allUrls = [];
+    const streamUrls = [];
 
     page.on("request", (request) => {
       const url = request.url();
-      // Track media-related requests for debugging
-      if (
-        url.includes(".m3u8") ||
-        url.includes(".mpd") ||
-        url.includes("manifest") ||
-        url.includes("stream") ||
-        url.includes("mdstrm") ||
-        url.includes("playlist")
-      ) {
-        console.log(`[capture] ${channel.id}: [req] ${url.substring(0, 150)}`);
-        allUrls.push(url);
-      }
-      if (isM3u8Request(url, channel.capturePatterns)) {
-        m3u8Urls.push(url);
+      if (isStreamRequest(url, channel.capturePatterns)) {
+        streamUrls.push(url);
       }
     });
 
@@ -64,27 +45,22 @@ async function captureStream(channel) {
       if (
         contentType.includes("mpegurl") ||
         contentType.includes("x-mpegurl") ||
-        contentType.includes("dash") ||
-        isM3u8Request(url, channel.capturePatterns)
+        contentType.includes("dash+xml") ||
+        isStreamRequest(url, channel.capturePatterns)
       ) {
-        console.log(
-          `[capture] ${channel.id}: [res] ${url.substring(0, 150)} (${contentType})`
-        );
-        if (!m3u8Urls.includes(url)) {
-          m3u8Urls.push(url);
+        if (!streamUrls.includes(url)) {
+          streamUrls.push(url);
         }
       }
     });
 
     console.log(`[capture] ${channel.id}: navigating to ${channel.url}`);
     await page.goto(channel.url, {
-      waitUntil: "networkidle",
+      waitUntil: "domcontentloaded",
       timeout: CAPTURE_TIMEOUT_MS,
     });
 
-    console.log(`[capture] ${channel.id}: page loaded, waiting for stream...`);
-
-    // Execute any page-specific actions (click play, dismiss modals, etc.)
+    // Execute page-specific actions (wait for splash, click cookies, etc.)
     for (const action of channel.actions || []) {
       try {
         if (action.type === "click") {
@@ -100,53 +76,28 @@ async function captureStream(channel) {
       }
     }
 
-    // Try clicking common play button selectors
-    const playSelectors = [
-      "button[aria-label='Play']",
-      ".vjs-big-play-button",
-      ".play-button",
-      "[class*='play']",
-      "video",
-    ];
-    for (const sel of playSelectors) {
-      try {
-        const el = await page.$(sel);
-        if (el) {
-          await el.click();
-          console.log(`[capture] ${channel.id}: auto-clicked ${sel}`);
-          await page.waitForTimeout(3000);
-          break;
-        }
-      } catch {
-        // ignore
-      }
-    }
-
-    // Wait for m3u8 request to appear
+    // Wait for stream requests to appear
     const startTime = Date.now();
-    while (m3u8Urls.length === 0 && Date.now() - startTime < CAPTURE_TIMEOUT_MS) {
+    while (
+      streamUrls.length === 0 &&
+      Date.now() - startTime < CAPTURE_TIMEOUT_MS
+    ) {
       await page.waitForTimeout(2000);
     }
 
-    // Log page title and URL for debugging
-    console.log(
-      `[capture] ${channel.id}: final URL=${page.url()}, tracked ${allUrls.length} media-related requests`
-    );
-
     await context.close();
 
-    if (m3u8Urls.length === 0) {
-      console.warn(`[capture] ${channel.id}: no m3u8 URLs found`);
+    if (streamUrls.length === 0) {
+      console.warn(`[capture] ${channel.id}: no stream URLs found`);
       return null;
     }
 
-    // Prefer the master/main playlist (usually the first one, or one without
-    // resolution-specific paths like _800, _480, etc.)
-    const masterUrl = selectMasterPlaylist(m3u8Urls);
+    // Convert to HLS if we got DASH/MPD
+    const hlsUrl = toHlsUrl(streamUrls, channel);
     console.log(
-      `[capture] ${channel.id}: found ${m3u8Urls.length} m3u8 URL(s), selected: ${masterUrl.substring(0, 100)}...`
+      `[capture] ${channel.id}: found ${streamUrls.length} stream URL(s), HLS: ${hlsUrl ? hlsUrl.substring(0, 120) + "..." : "none"}`
     );
-    return masterUrl;
+    return hlsUrl;
   } catch (err) {
     console.error(`[capture] ${channel.id}: error - ${err.message}`);
     return null;
@@ -156,22 +107,64 @@ async function captureStream(channel) {
 }
 
 /**
- * Check if a URL matches the channel's capture patterns.
+ * Check if a URL is a stream manifest request.
  */
-function isM3u8Request(url, patterns = []) {
-  const lowerUrl = url.toLowerCase();
-  if (!lowerUrl.includes(".m3u8")) return false;
+function isStreamRequest(url, patterns = []) {
+  const lower = url.toLowerCase();
+  const isStream = lower.includes(".m3u8") || lower.includes(".mpd");
+  if (!isStream) return false;
+  // Ignore ad-related manifests
+  if (lower.includes("ads.") || lower.includes("/ad/") || lower.includes("imasdk"))
+    return false;
   if (patterns.length === 0) return true;
-  return patterns.some((p) => lowerUrl.includes(p.toLowerCase()));
+  return patterns.some((p) => lower.includes(p.toLowerCase()));
 }
 
 /**
- * Select the best (master) playlist from captured URLs.
- * Prefers URLs without resolution suffixes, or the "live-stream-playlist"
- * pattern from mdstrm.com.
+ * Convert captured stream URLs to an HLS m3u8 URL.
+ *
+ * For mdstrm.com (Caracol), the DASH stream ID can be used to construct
+ * an HLS URL: https://mdstrm.com/live-stream-playlist/{streamId}.m3u8
  */
-function selectMasterPlaylist(urls) {
-  // Prefer master/main playlist patterns
+function toHlsUrl(urls, channel) {
+  // First check if we already have an m3u8 URL
+  const m3u8 = urls.find((u) => u.includes(".m3u8"));
+  if (m3u8) return selectBestM3u8(urls.filter((u) => u.includes(".m3u8")));
+
+  // If we have MPD URLs, try to derive the HLS URL
+  const mpdUrl = urls.find((u) => u.includes(".mpd"));
+  if (mpdUrl && channel.hlsTemplate) {
+    const streamId = extractStreamId(mpdUrl);
+    if (streamId) {
+      return channel.hlsTemplate.replace("{streamId}", streamId);
+    }
+  }
+
+  // Fallback: return the first MPD URL (Jellyfin can handle some DASH)
+  return mpdUrl || urls[0];
+}
+
+/**
+ * Extract the mdstrm.com stream ID from a URL.
+ * Pattern: /live-stream-playlist/{id}.mpd or /live-stream-dai/{id}/...
+ */
+function extractStreamId(url) {
+  const patterns = [
+    /live-stream-playlist\/([a-f0-9]+)\./,
+    /live-stream-dai\/([a-f0-9]+)\//,
+    /live-stream\/([a-f0-9]+)\./,
+  ];
+  for (const re of patterns) {
+    const match = url.match(re);
+    if (match) return match[1];
+  }
+  return null;
+}
+
+/**
+ * Select the best m3u8 URL from a list.
+ */
+function selectBestM3u8(urls) {
   const master = urls.find(
     (u) =>
       u.includes("live-stream-playlist/") ||
@@ -180,12 +173,8 @@ function selectMasterPlaylist(urls) {
   );
   if (master) return master;
 
-  // Prefer URLs without resolution indicators
   const nonVariant = urls.find(
-    (u) =>
-      !/_\d+/.test(u) &&
-      !/\/\d{3,4}\//.test(u) &&
-      !u.includes("chunklist")
+    (u) => !/_\d+/.test(u) && !/\/\d{3,4}\//.test(u) && !u.includes("chunklist")
   );
   if (nonVariant) return nonVariant;
 
@@ -194,10 +183,6 @@ function selectMasterPlaylist(urls) {
 
 /**
  * Capture streams for all channels sequentially.
- * Sequential to avoid overwhelming the node with multiple Chromium instances.
- *
- * @param {Object[]} channels
- * @returns {Promise<Object>} Map of channel ID -> captured URL
  */
 export async function captureAll(channels) {
   const results = {};
