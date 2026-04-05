@@ -42,7 +42,7 @@ async function runCapture() {
   }
 }
 
-const app = Fastify({ logger: false });
+const app = Fastify({ logger: false, maxParamLength: 2000 });
 
 /**
  * M3U playlist — points to local proxy URLs instead of external CDNs.
