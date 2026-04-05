@@ -107,13 +107,20 @@ app.get("/stream/:channelId/playlist.m3u8", async (req, reply) => {
 
 /**
  * HLS proxy — sub-playlists and segments.
- * The URL to fetch is base64-encoded in the path to avoid routing issues.
+ * URL scheme uses file extensions so ffmpeg's HLS demuxer accepts them:
+ *   /stream/:channelId/s/<base64url>.ts   — segments
+ *   /stream/:channelId/s/<base64url>.m3u8 — sub-playlists
+ *   /stream/:channelId/s/<base64url>.mp4  — init segments
  */
-app.get("/stream/:channelId/seg", async (req, reply) => {
+app.get("/stream/:channelId/s/:encoded", async (req, reply) => {
   const { channelId } = req.params;
-  const encodedUrl = req.query.u;
+  // Strip the fake extension (.ts, .m3u8, .mp4) to get the base64url
+  const encodedWithExt = req.params.encoded;
+  const dotIdx = encodedWithExt.lastIndexOf(".");
+  const encodedUrl = dotIdx >= 0 ? encodedWithExt.substring(0, dotIdx) : encodedWithExt;
+
   if (!encodedUrl) {
-    return reply.code(400).send({ error: "Missing u query parameter" });
+    return reply.code(400).send({ error: "Missing encoded URL" });
   }
   const url = Buffer.from(encodedUrl, "base64url").toString();
 
@@ -155,6 +162,17 @@ app.get("/stream/:channelId/seg", async (req, reply) => {
 });
 
 /**
+ * Infer a file extension for a URL to use in proxy paths.
+ * This ensures ffmpeg's HLS demuxer recognizes the file type.
+ */
+function inferExtension(url) {
+  const path = url.split("?")[0].toLowerCase();
+  if (path.endsWith(".m3u8")) return ".m3u8";
+  if (path.endsWith(".mp4") || path.endsWith(".m4s") || path.endsWith(".m4v") || path.endsWith(".m4a")) return ".mp4";
+  return ".ts";
+}
+
+/**
  * Rewrite URLs in an HLS manifest so they route through our proxy.
  * Handles both absolute and relative URLs.
  * Strips DRM key tags (skd://, FairPlay) since we can't proxy them.
@@ -184,15 +202,17 @@ function rewriteManifest(manifest, manifestUrl, baseUrl, channelId) {
             return _match;
           }
           const absUrl = resolveUrl(uri, manifestBase);
+          const ext = inferExtension(absUrl);
           const encoded = Buffer.from(absUrl).toString("base64url");
-          return `URI="${baseUrl}/stream/${channelId}/seg?u=${encoded}"`;
+          return `URI="${baseUrl}/stream/${channelId}/s/${encoded}${ext}"`;
         });
       }
 
       // This is a URL line — rewrite it
       const absUrl = resolveUrl(trimmed, manifestBase);
+      const ext = inferExtension(absUrl);
       const encoded = Buffer.from(absUrl).toString("base64url");
-      return `${baseUrl}/stream/${channelId}/seg?u=${encoded}`;
+      return `${baseUrl}/stream/${channelId}/s/${encoded}${ext}`;
     })
     .filter((line) => line !== null)
     .join("\n");
