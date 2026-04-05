@@ -44,13 +44,16 @@ async function runCapture() {
 
 const app = Fastify({ logger: false });
 
-app.get("/playlist.m3u", async (_req, reply) => {
-  // Trigger on-demand refresh if cache is stale
+/**
+ * M3U playlist — points to local proxy URLs instead of external CDNs.
+ */
+app.get("/playlist.m3u", async (req, reply) => {
   if (Date.now() - lastCaptureRun > STALE_THRESHOLD_MS) {
     await runCapture();
   }
 
   const channels = getChannels();
+  const baseUrl = `http://${req.headers.host}`;
   let m3u = "#EXTM3U\n";
 
   for (const ch of channels) {
@@ -58,11 +61,134 @@ app.get("/playlist.m3u", async (_req, reply) => {
     if (!cached) continue;
 
     m3u += `#EXTINF:-1 tvg-id="${ch.id}" tvg-name="${ch.name}" tvg-logo="${ch.logo || ""}",${ch.name}\n`;
-    m3u += `${cached.url}\n`;
+    m3u += `${baseUrl}/stream/${ch.id}/playlist.m3u8\n`;
   }
 
   reply.type("audio/x-mpegurl").send(m3u);
 });
+
+/**
+ * HLS proxy — master playlist.
+ * Fetches the upstream HLS manifest, follows redirects, and rewrites
+ * all URLs so sub-playlists and segments also go through our proxy.
+ */
+app.get("/stream/:channelId/playlist.m3u8", async (req, reply) => {
+  const { channelId } = req.params;
+  const cached = streamCache.get(channelId);
+  if (!cached) {
+    return reply.code(404).send({ error: "Channel not found or not captured" });
+  }
+
+  try {
+    const resp = await fetch(cached.url, {
+      redirect: "follow",
+      headers: { "User-Agent": "Mozilla/5.0" },
+    });
+    if (!resp.ok) {
+      return reply
+        .code(502)
+        .send({ error: `Upstream returned ${resp.status}` });
+    }
+
+    const upstreamUrl = resp.url; // final URL after redirects
+    const body = await resp.text();
+    const baseUrl = `http://${req.headers.host}`;
+    const rewritten = rewriteManifest(body, upstreamUrl, baseUrl, channelId);
+
+    reply
+      .type("application/vnd.apple.mpegurl")
+      .header("Cache-Control", "no-cache")
+      .send(rewritten);
+  } catch (err) {
+    console.error(`[proxy] ${channelId}: master playlist error - ${err.message}`);
+    reply.code(502).send({ error: err.message });
+  }
+});
+
+/**
+ * HLS proxy — sub-playlists and segments.
+ * The URL to fetch is base64-encoded in the path to avoid routing issues.
+ */
+app.get("/stream/:channelId/seg/:encodedUrl", async (req, reply) => {
+  const { channelId, encodedUrl } = req.params;
+  const url = Buffer.from(encodedUrl, "base64url").toString();
+
+  try {
+    const resp = await fetch(url, {
+      redirect: "follow",
+      headers: { "User-Agent": "Mozilla/5.0" },
+    });
+    if (!resp.ok) {
+      return reply
+        .code(502)
+        .send({ error: `Upstream returned ${resp.status}` });
+    }
+
+    const contentType = resp.headers.get("content-type") || "";
+
+    // If this is a sub-playlist (m3u8), rewrite its URLs too
+    if (contentType.includes("mpegurl") || url.endsWith(".m3u8")) {
+      const body = await resp.text();
+      const baseUrl = `http://${req.headers.host}`;
+      const rewritten = rewriteManifest(body, url, baseUrl, channelId);
+      return reply
+        .type("application/vnd.apple.mpegurl")
+        .header("Cache-Control", "no-cache")
+        .send(rewritten);
+    }
+
+    // Binary segment — pipe through
+    reply
+      .type(contentType || "video/mp2t")
+      .header("Cache-Control", "no-cache");
+    const buffer = Buffer.from(await resp.arrayBuffer());
+    return reply.send(buffer);
+  } catch (err) {
+    console.error(`[proxy] ${channelId}: segment error - ${err.message}`);
+    reply.code(502).send({ error: err.message });
+  }
+});
+
+/**
+ * Rewrite URLs in an HLS manifest so they route through our proxy.
+ * Handles both absolute and relative URLs.
+ */
+function rewriteManifest(manifest, manifestUrl, baseUrl, channelId) {
+  const manifestBase = manifestUrl.substring(
+    0,
+    manifestUrl.lastIndexOf("/") + 1
+  );
+
+  return manifest
+    .split("\n")
+    .map((line) => {
+      const trimmed = line.trim();
+      // Skip empty lines, comments, and tags (except URI= attributes)
+      if (!trimmed || trimmed.startsWith("#")) {
+        // Rewrite URI="..." attributes in tags like #EXT-X-MEDIA
+        return trimmed.replace(/URI="([^"]+)"/g, (_match, uri) => {
+          const absUrl = resolveUrl(uri, manifestBase);
+          const encoded = Buffer.from(absUrl).toString("base64url");
+          return `URI="${baseUrl}/stream/${channelId}/seg/${encoded}"`;
+        });
+      }
+      // This is a URL line — rewrite it
+      const absUrl = resolveUrl(trimmed, manifestBase);
+      const encoded = Buffer.from(absUrl).toString("base64url");
+      return `${baseUrl}/stream/${channelId}/seg/${encoded}`;
+    })
+    .join("\n");
+}
+
+/**
+ * Resolve a potentially relative URL against a base.
+ */
+function resolveUrl(url, base) {
+  if (url.startsWith("http://") || url.startsWith("https://")) {
+    return url;
+  }
+  return new URL(url, base).toString();
+}
 
 app.get("/health", async (_req, reply) => {
   const channels = getChannels();
@@ -73,7 +199,9 @@ app.get("/health", async (_req, reply) => {
     status: healthy ? "ok" : "unhealthy",
     channels: channels.length,
     captured: cached.length,
-    lastCapture: lastCaptureRun ? new Date(lastCaptureRun).toISOString() : null,
+    lastCapture: lastCaptureRun
+      ? new Date(lastCaptureRun).toISOString()
+      : null,
     captureInProgress,
   });
 });
@@ -93,7 +221,12 @@ app.get("/status", async (_req, reply) => {
     };
   });
 
-  reply.send({ channels: status, lastCapture: lastCaptureRun ? new Date(lastCaptureRun).toISOString() : null });
+  reply.send({
+    channels: status,
+    lastCapture: lastCaptureRun
+      ? new Date(lastCaptureRun).toISOString()
+      : null,
+  });
 });
 
 async function main() {
