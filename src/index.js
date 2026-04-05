@@ -148,7 +148,7 @@ app.get("/stream/:channelId/seg", async (req, reply) => {
     const buffer = Buffer.from(await resp.arrayBuffer());
     return reply.send(buffer);
   } catch (err) {
-    console.error(`[proxy] ${channelId}: segment error - ${err.message}`);
+    console.error(`[proxy] ${channelId}: segment error - ${err.message} | url: ${url.substring(0, 120)}`);
     reply.code(502).send({ error: err.message });
   }
 });
@@ -156,6 +156,7 @@ app.get("/stream/:channelId/seg", async (req, reply) => {
 /**
  * Rewrite URLs in an HLS manifest so they route through our proxy.
  * Handles both absolute and relative URLs.
+ * Strips DRM key tags (skd://, FairPlay) since we can't proxy them.
  */
 function rewriteManifest(manifest, manifestUrl, baseUrl, channelId) {
   const manifestBase = manifestUrl.substring(
@@ -167,20 +168,32 @@ function rewriteManifest(manifest, manifestUrl, baseUrl, channelId) {
     .split("\n")
     .map((line) => {
       const trimmed = line.trim();
-      // Skip empty lines, comments, and tags (except URI= attributes)
-      if (!trimmed || trimmed.startsWith("#")) {
-        // Rewrite URI="..." attributes in tags like #EXT-X-MEDIA
+      if (!trimmed) return trimmed;
+
+      if (trimmed.startsWith("#")) {
+        // Strip DRM key tags that use non-HTTP schemes (FairPlay skd://, etc.)
+        if (trimmed.startsWith("#EXT-X-KEY:") && /URI="(?!https?:\/\/)/.test(trimmed)) {
+          return null; // Remove this line
+        }
+
+        // Rewrite URI="..." attributes in tags like #EXT-X-MEDIA, #EXT-X-MAP
         return trimmed.replace(/URI="([^"]+)"/g, (_match, uri) => {
+          // Only rewrite HTTP(S) URIs — leave non-HTTP schemes untouched
+          if (!uri.startsWith("http://") && !uri.startsWith("https://")) {
+            return _match;
+          }
           const absUrl = resolveUrl(uri, manifestBase);
           const encoded = Buffer.from(absUrl).toString("base64url");
           return `URI="${baseUrl}/stream/${channelId}/seg?u=${encoded}"`;
         });
       }
+
       // This is a URL line — rewrite it
       const absUrl = resolveUrl(trimmed, manifestBase);
       const encoded = Buffer.from(absUrl).toString("base64url");
       return `${baseUrl}/stream/${channelId}/seg?u=${encoded}`;
     })
+    .filter((line) => line !== null)
     .join("\n");
 }
 

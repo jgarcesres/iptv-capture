@@ -8,7 +8,9 @@ COPY package.json ./
 # then set PLAYWRIGHT_BROWSERS_PATH so the node user can find them
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
 
-RUN npm install --production \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && npm install --production \
     && npx playwright install --with-deps chromium \
     && chmod -R o+rx /opt/pw-browsers \
     && rm -rf /var/lib/apt/lists/*
