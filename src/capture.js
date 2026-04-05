@@ -91,9 +91,20 @@ async function captureStream(channel) {
       }
     }
 
-    // Debug: log page title and check for error states
+    // Debug: log page title and video element state
     const title = await page.title();
-    console.log(`[capture] ${channel.id}: page title="${title}", streams so far: ${streamUrls.length}`);
+    const videoInfo = await page.evaluate(() => {
+      const videos = document.querySelectorAll('video');
+      const iframes = document.querySelectorAll('iframe');
+      return {
+        videoCount: videos.length,
+        videoSrcs: Array.from(videos).map(v => ({ src: v.src, currentSrc: v.currentSrc, readyState: v.readyState, paused: v.paused, error: v.error?.message })),
+        iframeCount: iframes.length,
+        iframeSrcs: Array.from(iframes).map(f => f.src).filter(s => s).slice(0, 5),
+        webdriver: navigator.webdriver,
+      };
+    });
+    console.log(`[capture] ${channel.id}: page title="${title}", streams so far: ${streamUrls.length}, debug: ${JSON.stringify(videoInfo)}`);
 
     // Wait for stream requests to appear
     const startTime = Date.now();
