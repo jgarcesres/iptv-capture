@@ -24,12 +24,12 @@ const DEFAULT_CHANNELS = [
     url: "https://www.canalrcn.com/co/tv-en-vivo",
     logo: "https://upload.wikimedia.org/wikipedia/commons/a/a4/Canal_RCN_logo.svg",
     // RCN uses TBX player with Broadpeak CDN (DASH .mpd)
-    // Player may need a click to trigger autoplay in headless mode
+    // TBX player loads async — need networkidle + wait for video element
     capturePatterns: [".mpd", "broadpeak.io"],
+    waitUntil: "networkidle",
     actions: [
-      { type: "wait", ms: 5000 },
-      { type: "click", selector: "video" },
-      { type: "wait", ms: 15000 },
+      { type: "waitForSelector", selector: "video", ms: 30000 },
+      { type: "wait", ms: 10000 },
     ],
   },
 ];

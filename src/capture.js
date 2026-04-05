@@ -71,7 +71,7 @@ async function captureStream(channel) {
 
     console.log(`[capture] ${channel.id}: navigating to ${channel.url}`);
     await page.goto(channel.url, {
-      waitUntil: "domcontentloaded",
+      waitUntil: channel.waitUntil || "domcontentloaded",
       timeout: CAPTURE_TIMEOUT_MS,
     });
 
@@ -83,6 +83,9 @@ async function captureStream(channel) {
           console.log(`[capture] ${channel.id}: clicked ${action.selector}`);
         } else if (action.type === "wait") {
           await page.waitForTimeout(action.ms || 3000);
+        } else if (action.type === "waitForSelector") {
+          await page.waitForSelector(action.selector, { timeout: action.ms || 15000 });
+          console.log(`[capture] ${channel.id}: found ${action.selector}`);
         }
       } catch {
         console.warn(
