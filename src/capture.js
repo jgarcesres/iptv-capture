@@ -20,6 +20,7 @@ async function captureStream(channel) {
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
         "--disable-gpu",
+        "--autoplay-policy=no-user-gesture-required",
       ],
     });
 
@@ -30,6 +31,15 @@ async function captureStream(channel) {
     });
 
     const page = await context.newPage();
+
+    // Mask webdriver/automation signals that some players detect
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => false });
+      // Remove Playwright-injected properties
+      delete window.__playwright;
+      delete window.__pw_manual;
+    });
+
     const streamUrls = [];
 
     page.on("request", (request) => {
