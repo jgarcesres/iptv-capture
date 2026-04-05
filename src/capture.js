@@ -5,13 +5,88 @@ const CAPTURE_TIMEOUT_MS = parseInt(
 );
 
 /**
- * Captures the live HLS m3u8 URL from a single channel page.
+ * Captures the live stream URL from a channel using its configured method.
  *
- * Opens a headless Chromium browser, navigates to the channel URL,
- * executes page-specific actions, and intercepts network requests
- * to find the stream manifest (m3u8 or mpd).
+ * Channels with `api` config use direct API calls (faster, no browser needed).
+ * Others use headless Chromium to intercept network requests.
  */
 async function captureStream(channel) {
+  if (channel.api) {
+    return captureViaApi(channel);
+  }
+  return captureViaBrowser(channel);
+}
+
+/**
+ * Capture stream URL via direct API calls (e.g., TBX Unity API).
+ *
+ * Flow: get anonymous JWT → fetch content URL → extract HLS/DASH manifest.
+ */
+async function captureViaApi(channel) {
+  try {
+    const { authUrl, contentUrl, clientId, headers: extraHeaders } = channel.api;
+
+    // Step 1: Get anonymous auth token
+    console.log(`[capture] ${channel.id}: fetching auth token from API`);
+    const authResp = await fetch(authUrl, {
+      headers: { "x-client-id": clientId, ...extraHeaders },
+    });
+    if (!authResp.ok) {
+      console.error(`[capture] ${channel.id}: auth failed (${authResp.status})`);
+      return null;
+    }
+    const authData = await authResp.json();
+    const token = authData.access_token || authData.token;
+    if (!token) {
+      console.error(`[capture] ${channel.id}: no token in auth response`);
+      return null;
+    }
+
+    // Step 2: Get content/stream URL
+    console.log(`[capture] ${channel.id}: fetching stream URL from API`);
+    const urlResp = await fetch(contentUrl, {
+      headers: {
+        "x-client-id": clientId,
+        Authorization: `Bearer ${token}`,
+        ...extraHeaders,
+      },
+    });
+    if (!urlResp.ok) {
+      console.error(`[capture] ${channel.id}: content URL failed (${urlResp.status})`);
+      return null;
+    }
+    const urlData = await urlResp.json();
+
+    // Step 3: Extract the best stream URL from entitlements
+    const entitlements = urlData.entitlements || [];
+    // Prefer HLS over DASH
+    const hlsEntry = entitlements.find(
+      (e) => e.type === "media" && e.contentType === "application/x-mpegURL"
+    );
+    const dashEntry = entitlements.find(
+      (e) => e.type === "media" && e.contentType === "application/dash+xml"
+    );
+    const entry = hlsEntry || dashEntry;
+
+    if (!entry?.url) {
+      console.warn(`[capture] ${channel.id}: no stream URL in API response`);
+      return null;
+    }
+
+    console.log(
+      `[capture] ${channel.id}: captured stream URL via API: ${entry.url.substring(0, 120)}...`
+    );
+    return entry.url;
+  } catch (err) {
+    console.error(`[capture] ${channel.id}: API capture error - ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Capture stream URL via headless Chromium browser interception.
+ */
+async function captureViaBrowser(channel) {
   let browser;
   try {
     browser = await chromium.launch({
@@ -35,7 +110,6 @@ async function captureStream(channel) {
     // Mask webdriver/automation signals that some players detect
     await page.addInitScript(() => {
       Object.defineProperty(navigator, "webdriver", { get: () => false });
-      // Remove Playwright-injected properties
       delete window.__playwright;
       delete window.__pw_manual;
     });
@@ -44,11 +118,6 @@ async function captureStream(channel) {
 
     page.on("request", (request) => {
       const url = request.url();
-      // Debug: log video-related requests
-      const lower = url.toLowerCase();
-      if (lower.includes(".mpd") || lower.includes(".m3u8") || lower.includes("manifest")) {
-        console.log(`[capture] ${channel.id}: [req] ${url.substring(0, 150)}`);
-      }
       if (isStreamRequest(url, channel.capturePatterns)) {
         streamUrls.push(url);
       }
@@ -84,7 +153,9 @@ async function captureStream(channel) {
         } else if (action.type === "wait") {
           await page.waitForTimeout(action.ms || 3000);
         } else if (action.type === "waitForSelector") {
-          await page.waitForSelector(action.selector, { timeout: action.ms || 15000 });
+          await page.waitForSelector(action.selector, {
+            timeout: action.ms || 15000,
+          });
           console.log(`[capture] ${channel.id}: found ${action.selector}`);
         }
       } catch {
@@ -93,21 +164,6 @@ async function captureStream(channel) {
         );
       }
     }
-
-    // Debug: log page title and video element state
-    const title = await page.title();
-    const videoInfo = await page.evaluate(() => {
-      const videos = document.querySelectorAll('video');
-      const iframes = document.querySelectorAll('iframe');
-      return {
-        videoCount: videos.length,
-        videoSrcs: Array.from(videos).map(v => ({ src: v.src, currentSrc: v.currentSrc, readyState: v.readyState, paused: v.paused, error: v.error?.message })),
-        iframeCount: iframes.length,
-        iframeSrcs: Array.from(iframes).map(f => f.src).filter(s => s).slice(0, 5),
-        webdriver: navigator.webdriver,
-      };
-    });
-    console.log(`[capture] ${channel.id}: page title="${title}", streams so far: ${streamUrls.length}, debug: ${JSON.stringify(videoInfo)}`);
 
     // Wait for stream requests to appear
     const startTime = Date.now();
@@ -147,7 +203,11 @@ function isStreamRequest(url, patterns = []) {
   const isStream = lower.includes(".m3u8") || lower.includes(".mpd");
   if (!isStream) return false;
   // Ignore ad-related manifests
-  if (lower.includes("ads.") || lower.includes("/ad/") || lower.includes("imasdk"))
+  if (
+    lower.includes("ads.") ||
+    lower.includes("/ad/") ||
+    lower.includes("imasdk")
+  )
     return false;
   if (patterns.length === 0) return true;
   return patterns.some((p) => lower.includes(p.toLowerCase()));
@@ -207,7 +267,8 @@ function selectBestM3u8(urls) {
   if (master) return master;
 
   const nonVariant = urls.find(
-    (u) => !/_\d+/.test(u) && !/\/\d{3,4}\//.test(u) && !u.includes("chunklist")
+    (u) =>
+      !/_\d+/.test(u) && !/\/\d{3,4}\//.test(u) && !u.includes("chunklist")
   );
   if (nonVariant) return nonVariant;
 

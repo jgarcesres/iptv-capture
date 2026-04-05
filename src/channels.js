@@ -23,14 +23,15 @@ const DEFAULT_CHANNELS = [
     name: "Canal RCN",
     url: "https://www.canalrcn.com/co/tv-en-vivo",
     logo: "https://upload.wikimedia.org/wikipedia/commons/a/a4/Canal_RCN_logo.svg",
-    // RCN uses TBX player with Broadpeak CDN (DASH .mpd)
-    // TBX player loads async — need networkidle + wait for video element
-    capturePatterns: [".mpd", "broadpeak.io"],
-    waitUntil: "networkidle",
-    actions: [
-      { type: "waitForSelector", selector: "video", ms: 30000 },
-      { type: "wait", ms: 10000 },
-    ],
+    // RCN uses TBX player with DRM (Widevine) — headless Chromium can't play it.
+    // Instead, call the TBX Unity API directly to get the stream URL.
+    // Content ID 67535f2a8e10fec44f483a50 = "RCN Señal en Vivo" (BROADCAST, free)
+    api: {
+      clientId: "801ca66694329da3ba697f38c94bf0a1",
+      authUrl: "https://unity.tbxapis.com/v0/auth/public",
+      contentUrl:
+        "https://unity.tbxapis.com/v0/contents/67535f2a8e10fec44f483a50/url",
+    },
   },
 ];
 
