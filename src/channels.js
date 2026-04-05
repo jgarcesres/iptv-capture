@@ -24,13 +24,11 @@ const DEFAULT_CHANNELS = [
     url: "https://www.canalrcn.com/co/tv-en-vivo",
     logo: "https://upload.wikimedia.org/wikipedia/commons/a/a4/Canal_RCN_logo.svg",
     // RCN uses TBX player with DRM (Widevine) — headless Chromium can't play it.
-    // Instead, call the TBX Unity API directly to get the stream URL.
-    // Content ID 67535f2a8e10fec44f483a50 = "RCN Señal en Vivo" (BROADCAST, free)
-    api: {
-      clientId: "801ca66694329da3ba697f38c94bf0a1",
-      authUrl: "https://unity.tbxapis.com/v0/auth/public",
-      contentUrl:
-        "https://unity.tbxapis.com/v0/contents/67535f2a8e10fec44f483a50/url",
+    // Instead, load the page and intercept the TBX Unity API response that
+    // returns the stream URL. The page JS handles auth automatically.
+    apiIntercept: {
+      urlPattern: "/contents/67535f2a8e10fec44f483a50/url",
+      preferHls: true,
     },
   },
 ];

@@ -7,84 +7,110 @@ const CAPTURE_TIMEOUT_MS = parseInt(
 /**
  * Captures the live stream URL from a channel using its configured method.
  *
- * Channels with `api` config use direct API calls (faster, no browser needed).
- * Others use headless Chromium to intercept network requests.
+ * Channels with `apiIntercept` config use Playwright to load the page and
+ * intercept the API response containing the stream URL (for DRM-protected
+ * players that won't play in headless Chromium).
+ * Others use standard network request interception for stream manifests.
  */
 async function captureStream(channel) {
-  if (channel.api) {
-    return captureViaApi(channel);
+  if (channel.apiIntercept) {
+    return captureViaApiIntercept(channel);
   }
   return captureViaBrowser(channel);
 }
 
 /**
- * Capture stream URL via direct API calls (e.g., TBX Unity API).
+ * Capture stream URL by intercepting the player's API response.
  *
- * Flow: get anonymous JWT → fetch content URL → extract HLS/DASH manifest.
+ * Some players (e.g., TBX) use DRM and won't play in headless Chromium,
+ * but they still call their API to get the stream URL. We load the page
+ * and intercept that API response to extract the manifest URL.
  */
-async function captureViaApi(channel) {
+async function captureViaApiIntercept(channel) {
+  let browser;
   try {
-    const { authUrl, contentUrl, clientId, headers: extraHeaders } = channel.api;
-
-    // Step 1: Get anonymous auth token
-    console.log(`[capture] ${channel.id}: fetching auth token from API`);
-    const authResp = await fetch(authUrl, {
-      headers: { "x-client-id": clientId, ...extraHeaders },
+    browser = await chromium.launch({
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+      ],
     });
-    if (!authResp.ok) {
-      console.error(`[capture] ${channel.id}: auth failed (${authResp.status})`);
-      return null;
-    }
-    const authData = await authResp.json();
-    const token = authData.access_token || authData.token;
-    if (!token) {
-      console.error(`[capture] ${channel.id}: no token in auth response`);
-      return null;
-    }
 
-    // Step 2: Get content/stream URL
-    console.log(`[capture] ${channel.id}: fetching stream URL from API`);
-    const urlResp = await fetch(contentUrl, {
-      headers: {
-        "x-client-id": clientId,
-        Authorization: `Bearer ${token}`,
-        ...extraHeaders,
-      },
+    const context = await browser.newContext({
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      viewport: { width: 1280, height: 720 },
     });
-    if (!urlResp.ok) {
-      console.error(`[capture] ${channel.id}: content URL failed (${urlResp.status})`);
+
+    const page = await context.newPage();
+    const { urlPattern, preferHls } = channel.apiIntercept;
+    let streamUrl = null;
+
+    // Intercept API responses that match the pattern
+    page.on("response", async (response) => {
+      const url = response.url();
+      if (!url.includes(urlPattern)) return;
+
+      try {
+        const data = await response.json();
+        const entitlements = data.entitlements || [];
+
+        // Find HLS or DASH media entitlement
+        const hlsEntry = entitlements.find(
+          (e) =>
+            e.type === "media" &&
+            e.contentType === "application/x-mpegURL"
+        );
+        const dashEntry = entitlements.find(
+          (e) =>
+            e.type === "media" &&
+            e.contentType === "application/dash+xml"
+        );
+        const entry = preferHls !== false ? (hlsEntry || dashEntry) : (dashEntry || hlsEntry);
+
+        if (entry?.url) {
+          streamUrl = entry.url;
+          console.log(
+            `[capture] ${channel.id}: intercepted stream URL from API: ${streamUrl.substring(0, 120)}...`
+          );
+        }
+      } catch {
+        // Response wasn't JSON or didn't have expected structure
+      }
+    });
+
+    console.log(`[capture] ${channel.id}: navigating to ${channel.url}`);
+    await page.goto(channel.url, {
+      waitUntil: "networkidle",
+      timeout: CAPTURE_TIMEOUT_MS,
+    });
+
+    // Wait a bit more for the API call to complete if not found yet
+    const startTime = Date.now();
+    while (!streamUrl && Date.now() - startTime < CAPTURE_TIMEOUT_MS) {
+      await page.waitForTimeout(2000);
+    }
+
+    await context.close();
+
+    if (!streamUrl) {
+      console.warn(`[capture] ${channel.id}: no stream URL intercepted from API`);
       return null;
     }
-    const urlData = await urlResp.json();
 
-    // Step 3: Extract the best stream URL from entitlements
-    const entitlements = urlData.entitlements || [];
-    // Prefer HLS over DASH
-    const hlsEntry = entitlements.find(
-      (e) => e.type === "media" && e.contentType === "application/x-mpegURL"
-    );
-    const dashEntry = entitlements.find(
-      (e) => e.type === "media" && e.contentType === "application/dash+xml"
-    );
-    const entry = hlsEntry || dashEntry;
-
-    if (!entry?.url) {
-      console.warn(`[capture] ${channel.id}: no stream URL in API response`);
-      return null;
-    }
-
-    console.log(
-      `[capture] ${channel.id}: captured stream URL via API: ${entry.url.substring(0, 120)}...`
-    );
-    return entry.url;
+    return streamUrl;
   } catch (err) {
-    console.error(`[capture] ${channel.id}: API capture error - ${err.message}`);
+    console.error(`[capture] ${channel.id}: error - ${err.message}`);
     return null;
+  } finally {
+    if (browser) await browser.close();
   }
 }
 
 /**
- * Capture stream URL via headless Chromium browser interception.
+ * Capture stream URL via headless Chromium network request interception.
  */
 async function captureViaBrowser(channel) {
   let browser;
@@ -239,7 +265,6 @@ function toHlsUrl(urls, channel) {
 
 /**
  * Extract the mdstrm.com stream ID from a URL.
- * Pattern: /live-stream-playlist/{id}.mpd or /live-stream-dai/{id}/...
  */
 function extractStreamId(url) {
   const patterns = [
