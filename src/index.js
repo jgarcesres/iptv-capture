@@ -179,8 +179,8 @@ function rewriteManifest(manifest, manifestUrl, baseUrl, channelId) {
 
         // Rewrite URI="..." attributes in tags like #EXT-X-MEDIA, #EXT-X-MAP
         return trimmed.replace(/URI="([^"]+)"/g, (_match, uri) => {
-          // Only rewrite HTTP(S) URIs — leave non-HTTP schemes untouched
-          if (!uri.startsWith("http://") && !uri.startsWith("https://")) {
+          // Skip non-HTTP schemes (skd://, data:, etc.) — can't be proxied
+          if (/^[a-z][a-z0-9+.-]*:/i.test(uri) && !uri.startsWith("http://") && !uri.startsWith("https://")) {
             return _match;
           }
           const absUrl = resolveUrl(uri, manifestBase);
