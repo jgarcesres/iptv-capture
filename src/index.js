@@ -131,7 +131,8 @@ app.get("/stream/:channelId/seg", async (req, reply) => {
     const contentType = resp.headers.get("content-type") || "";
 
     // If this is a sub-playlist (m3u8), rewrite its URLs too
-    if (contentType.includes("mpegurl") || url.endsWith(".m3u8")) {
+    const urlPath = url.split("?")[0];
+    if (contentType.includes("mpegurl") || urlPath.endsWith(".m3u8")) {
       const body = await resp.text();
       const baseUrl = `http://${req.headers.host}`;
       const rewritten = rewriteManifest(body, url, baseUrl, channelId);
