@@ -109,8 +109,12 @@ app.get("/stream/:channelId/playlist.m3u8", async (req, reply) => {
  * HLS proxy — sub-playlists and segments.
  * The URL to fetch is base64-encoded in the path to avoid routing issues.
  */
-app.get("/stream/:channelId/seg/:encodedUrl", async (req, reply) => {
-  const { channelId, encodedUrl } = req.params;
+app.get("/stream/:channelId/seg", async (req, reply) => {
+  const { channelId } = req.params;
+  const encodedUrl = req.query.u;
+  if (!encodedUrl) {
+    return reply.code(400).send({ error: "Missing u query parameter" });
+  }
   const url = Buffer.from(encodedUrl, "base64url").toString();
 
   try {
@@ -169,13 +173,13 @@ function rewriteManifest(manifest, manifestUrl, baseUrl, channelId) {
         return trimmed.replace(/URI="([^"]+)"/g, (_match, uri) => {
           const absUrl = resolveUrl(uri, manifestBase);
           const encoded = Buffer.from(absUrl).toString("base64url");
-          return `URI="${baseUrl}/stream/${channelId}/seg/${encoded}"`;
+          return `URI="${baseUrl}/stream/${channelId}/seg?u=${encoded}"`;
         });
       }
       // This is a URL line — rewrite it
       const absUrl = resolveUrl(trimmed, manifestBase);
       const encoded = Buffer.from(absUrl).toString("base64url");
-      return `${baseUrl}/stream/${channelId}/seg/${encoded}`;
+      return `${baseUrl}/stream/${channelId}/seg?u=${encoded}`;
     })
     .join("\n");
 }
