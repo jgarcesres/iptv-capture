@@ -1,6 +1,16 @@
 import Fastify from "fastify";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { captureAll } from "./capture.js";
 import { getChannels } from "./channels.js";
+import {
+  startDecryptPipeline,
+  stopAll,
+  isDecryptRunning,
+  readDecryptedPlaylist,
+  getDecryptedPlaylistPath,
+  getHlsOutputDir,
+} from "./decrypt.js";
 
 const PORT = parseInt(process.env.PORT || "8080");
 const REFRESH_INTERVAL_MS = parseInt(
@@ -26,12 +36,28 @@ async function runCapture() {
 
   try {
     const results = await captureAll(channels);
-    for (const [id, url] of Object.entries(results)) {
-      if (url) {
-        streamCache.set(id, { url, capturedAt: Date.now() });
-        console.log(`[capture] ${id}: captured stream URL`);
-      } else {
+    for (const [id, result] of Object.entries(results)) {
+      if (!result) {
         console.warn(`[capture] ${id}: failed to capture`);
+        continue;
+      }
+
+      // Result can be a string (URL) or an object with {url, dashUrl?, widevineLicenseUrl?}
+      const isRich = typeof result === "object";
+      const url = isRich ? result.url : result;
+      const entry = { url, capturedAt: Date.now() };
+
+      if (isRich && result.dashUrl) entry.dashUrl = result.dashUrl;
+      if (isRich && result.widevineLicenseUrl) entry.widevineLicenseUrl = result.widevineLicenseUrl;
+
+      streamCache.set(id, entry);
+      console.log(`[capture] ${id}: captured stream URL${entry.dashUrl ? " + DASH URL" : ""}${entry.widevineLicenseUrl ? " + Widevine license" : ""}`);
+
+      // Start decryption pipeline if we have DASH + Widevine license
+      if (entry.dashUrl && entry.widevineLicenseUrl) {
+        startDecryptPipeline(id, entry.dashUrl, entry.widevineLicenseUrl).catch((err) => {
+          console.error(`[decrypt] ${id}: failed to start pipeline - ${err.message}`);
+        });
       }
     }
     lastCaptureRun = Date.now();
@@ -79,6 +105,22 @@ app.get("/stream/:channelId/playlist.m3u8", async (req, reply) => {
     return reply.code(404).send({ error: "Channel not found or not captured" });
   }
 
+  // If we have a decrypted local stream, serve that instead
+  const decryptedPlaylist = readDecryptedPlaylist(channelId);
+  if (decryptedPlaylist) {
+    // Rewrite segment paths to serve through our local file endpoint
+    const baseUrl = `http://${req.headers.host}`;
+    const rewritten = decryptedPlaylist.replace(
+      /^(seg_\d+\.ts)$/gm,
+      `${baseUrl}/stream/${channelId}/local/$1`
+    );
+    return reply
+      .type("application/vnd.apple.mpegurl")
+      .header("Cache-Control", "no-cache")
+      .send(rewritten);
+  }
+
+  // Fallback: proxy the upstream (encrypted) stream
   try {
     const resp = await fetch(cached.url, {
       redirect: "follow",
@@ -103,6 +145,34 @@ app.get("/stream/:channelId/playlist.m3u8", async (req, reply) => {
     console.error(`[proxy] ${channelId}: master playlist error - ${err.message}`);
     reply.code(502).send({ error: err.message });
   }
+});
+
+/**
+ * Serve local decrypted HLS segments from disk.
+ */
+app.get("/stream/:channelId/local/:filename", async (req, reply) => {
+  const { channelId, filename } = req.params;
+
+  // Sanitize filename to prevent path traversal
+  if (filename.includes("/") || filename.includes("..")) {
+    return reply.code(400).send({ error: "Invalid filename" });
+  }
+
+  const filePath = join(getHlsOutputDir(channelId), filename);
+  if (!existsSync(filePath)) {
+    return reply.code(404).send({ error: "Segment not found" });
+  }
+
+  const data = readFileSync(filePath);
+
+  const contentType = filename.endsWith(".m3u8")
+    ? "application/vnd.apple.mpegurl"
+    : "video/mp2t";
+
+  reply
+    .type(contentType)
+    .header("Cache-Control", "no-cache")
+    .send(data);
 });
 
 /**
@@ -256,6 +326,10 @@ app.get("/status", async (_req, reply) => {
       ageMinutes: cached
         ? Math.round((Date.now() - cached.capturedAt) / 60000)
         : null,
+      hasDash: !!cached?.dashUrl,
+      hasWidevineLicense: !!cached?.widevineLicenseUrl,
+      decryptRunning: isDecryptRunning(ch.id),
+      decryptedPlaylist: !!getDecryptedPlaylistPath(ch.id),
     };
   });
 
@@ -282,3 +356,12 @@ main().catch((err) => {
   console.error("Failed to start:", err);
   process.exit(1);
 });
+
+// Graceful shutdown — stop ffmpeg processes
+for (const sig of ["SIGTERM", "SIGINT"]) {
+  process.on(sig, () => {
+    console.log(`[server] Received ${sig}, shutting down...`);
+    stopAll();
+    process.exit(0);
+  });
+}

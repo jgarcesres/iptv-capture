@@ -49,6 +49,8 @@ async function captureViaApiIntercept(channel) {
     let streamUrl = null;
 
     // Intercept API responses that match the pattern
+    let captureResult = null;
+
     page.on("response", async (response) => {
       const url = response.url();
       if (!url.includes(urlPattern)) return;
@@ -57,7 +59,17 @@ async function captureViaApiIntercept(channel) {
         const data = await response.json();
         const entitlements = data.entitlements || [];
 
-        // Find HLS or DASH media entitlement
+        // Log full entitlements structure for debugging
+        console.log(
+          `[capture] ${channel.id}: API response has ${entitlements.length} entitlement(s)`
+        );
+        for (const e of entitlements) {
+          console.log(
+            `[capture] ${channel.id}:   type=${e.type} contentType=${e.contentType} drm=${JSON.stringify(Object.keys(e.drm || {}))}`
+          );
+        }
+
+        // Find HLS and DASH media entitlements
         const hlsEntry = entitlements.find(
           (e) =>
             e.type === "media" &&
@@ -75,6 +87,40 @@ async function captureViaApiIntercept(channel) {
           console.log(
             `[capture] ${channel.id}: intercepted stream URL from API: ${streamUrl.substring(0, 120)}...`
           );
+
+          // Extract DRM info for Widevine decryption
+          const result = { url: entry.url };
+
+          if (dashEntry?.url) {
+            result.dashUrl = dashEntry.url;
+          }
+
+          // Extract Widevine license URL from DASH entitlement DRM config
+          const drmSource = dashEntry || entry;
+          const drm = drmSource?.drm;
+          if (drm) {
+            // Try common DRM config structures
+            const widevineLicenseUrl =
+              drm.widevine?.licenseUrl ||
+              drm.widevine?.license_url ||
+              drm.widevine?.serverUrl ||
+              drm.widevine?.url ||
+              drm["com.widevine.alpha"]?.licenseUrl ||
+              drm["com.widevine.alpha"]?.url;
+
+            if (widevineLicenseUrl) {
+              result.widevineLicenseUrl = widevineLicenseUrl;
+              console.log(
+                `[capture] ${channel.id}: Widevine license URL: ${widevineLicenseUrl.substring(0, 120)}...`
+              );
+            } else {
+              console.log(
+                `[capture] ${channel.id}: DRM config found but no Widevine license URL. DRM keys: ${JSON.stringify(drm).substring(0, 300)}`
+              );
+            }
+          }
+
+          captureResult = result;
         }
       } catch {
         // Response wasn't JSON or didn't have expected structure
@@ -100,7 +146,8 @@ async function captureViaApiIntercept(channel) {
       return null;
     }
 
-    return streamUrl;
+    // Return rich result with DRM info if available, or just the URL string
+    return captureResult || streamUrl;
   } catch (err) {
     console.error(`[capture] ${channel.id}: error - ${err.message}`);
     return null;

@@ -28,7 +28,7 @@ const DEFAULT_CHANNELS = [
     // returns the stream URL. The page JS handles auth automatically.
     apiIntercept: {
       urlPattern: "/contents/67535f2a8e10fec44f483a50/url",
-      preferHls: true,
+      preferHls: false, // Prefer DASH for Widevine decryption
     },
   },
 ];
